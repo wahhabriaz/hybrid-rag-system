@@ -12,6 +12,7 @@ load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import aiofiles
 import hashlib
@@ -42,6 +43,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.mount("/app", StaticFiles(directory="frontend", html=True), name="frontend")
+
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -69,13 +72,12 @@ except Exception as e:
     logger.warning(f"Langfuse disabled: {e}")
 
 documents_registry: dict = {}
-file_hashes: dict = {}  # hash -> doc_id (in-memory cache)
+file_hashes: dict = {}
 
 def get_db():
     return psycopg2.connect(os.getenv("POSTGRES_URL", "postgresql://raguser:ragpass@localhost:5432/ragdb"))
 
 def init_db():
-    """Create table for file hashes if not exists"""
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -88,7 +90,6 @@ def init_db():
             )
         """)
         conn.commit()
-        # Загружаем существующие хэши в память
         cur.execute("SELECT hash, doc_id FROM file_hashes")
         for row in cur.fetchall():
             file_hashes[row[0]] = row[1]
@@ -98,16 +99,7 @@ def init_db():
     except Exception as e:
         logger.warning(f"DB init failed: {e}")
 
-@app.on_event("startup")
-async def startup():
-    vector_store.create_collection(vector_size=embedder.get_vector_size())
-    init_db()
-    await restore_from_qdrant()
-    logger.info("RAG Knowledge Base API started")
-
-
 async def restore_from_qdrant():
-    """Восстанавливаем BM25 + documents_registry из Qdrant при старте."""
     try:
         all_points = []
         offset = None
@@ -155,7 +147,7 @@ async def restore_from_qdrant():
                     doc_meta[doc_id] = {
                         "doc_id": doc_id,
                         "filename": filename,
-                        "pages": p.get("pages", p.get("total_pages", 0)),
+                        "pages": p.get("pages", 0),
                         "chunks": 0,
                         "size_kb": p.get("size_kb", 0),
                         "metadata": p.get("metadata", {}),
@@ -172,6 +164,13 @@ async def restore_from_qdrant():
 
     except Exception as e:
         logger.warning(f"Restore failed (non-critical): {e}")
+
+@app.on_event("startup")
+async def startup():
+    vector_store.create_collection(vector_size=embedder.get_vector_size())
+    init_db()
+    await restore_from_qdrant()
+    logger.info("RAG Knowledge Base API started")
 
 
 class QueryRequest(BaseModel):
@@ -208,13 +207,13 @@ async def upload_document(file: UploadFile = File(...)):
 
     parsed = parser.parse(str(file_path))
     chunks = chunker.chunk_document(parsed.pages, doc_id)
-    # Проставляем filename и pages каждому чанку
-    for c in chunks:
-        c.filename = file.filename
-        c.pages = parsed.total_pages
 
     if not chunks:
         raise HTTPException(422, "Could not extract text from document")
+
+    for c in chunks:
+        c.filename = file.filename
+        c.pages = parsed.total_pages
 
     texts = [c.text for c in chunks]
     vectors = embedder.embed_batch(texts)
@@ -239,6 +238,7 @@ async def upload_document(file: UploadFile = File(...)):
         conn.close()
     except Exception as e:
         logger.warning(f"DB save hash failed: {e}")
+
     documents_registry[doc_id] = {
         "doc_id": doc_id,
         "filename": file.filename,
@@ -257,27 +257,13 @@ async def upload_document(file: UploadFile = File(...)):
     }
 
 
-@app.post("/query", response_model=QueryResponse)
-async def query_knowledge_base(request: QueryRequest):
-    if not request.question.strip():
-        raise HTTPException(400, "Question cannot be empty")
-
-    start_time = time.time()
-
-    # Langfuse v2 trace
-
 @app.post("/upload-batch")
 async def upload_batch(files: list[UploadFile] = File(...)):
-    """Upload multiple PDF files at once."""
     results = []
     for file in files:
         try:
             if not file.filename.endswith(".pdf"):
-                results.append({
-                    "filename": file.filename,
-                    "status": "error",
-                    "error": "Only PDF files supported"
-                })
+                results.append({"filename": file.filename, "status": "error", "error": "Only PDF files supported"})
                 continue
 
             content = await file.read()
@@ -286,11 +272,7 @@ async def upload_batch(files: list[UploadFile] = File(...)):
             if file_hash in file_hashes:
                 existing_id = file_hashes[file_hash]
                 existing = documents_registry.get(existing_id, {})
-                results.append({
-                    "filename": file.filename,
-                    "status": "skipped",
-                    "error": f"Already uploaded as '{existing.get('filename', existing_id)}'"
-                })
+                results.append({"filename": file.filename, "status": "skipped", "error": f"Already uploaded as '{existing.get('filename', existing_id)}'"})
                 continue
 
             doc_id = str(uuid.uuid4())[:8]
@@ -303,11 +285,7 @@ async def upload_batch(files: list[UploadFile] = File(...)):
             chunks = chunker.chunk_document(parsed.pages, doc_id)
 
             if not chunks:
-                results.append({
-                    "filename": file.filename,
-                    "status": "error",
-                    "error": "Could not extract text"
-                })
+                results.append({"filename": file.filename, "status": "error", "error": "Could not extract text"})
                 continue
 
             for c in chunks:
@@ -318,13 +296,11 @@ async def upload_batch(files: list[UploadFile] = File(...)):
             vectors = embedder.embed_batch(texts)
             vector_store.upsert_chunks(chunks, vectors)
 
-            bm25_chunks = [{"text": c.text, "chunk_id": c.chunk_id,
-                            "page_num": c.page_num, "document_id": c.document_id,
-                            "chunk_index": c.chunk_index, "filename": c.filename}
-                           for c in chunks]
-            retriever.index_chunks_for_bm25(
-                retriever._bm25_chunks + bm25_chunks
-            )
+            new_bm25 = [{"text": c.text, "chunk_id": c.chunk_id,
+                         "page_num": c.page_num, "document_id": c.document_id,
+                         "chunk_index": c.chunk_index, "filename": c.filename}
+                        for c in chunks]
+            retriever.index_chunks_for_bm25(retriever._bm25_chunks + new_bm25)
 
             file_hashes[file_hash] = doc_id
             try:
@@ -348,49 +324,33 @@ async def upload_batch(files: list[UploadFile] = File(...)):
                 "size_kb": parsed.file_size_kb,
                 "metadata": parsed.metadata
             }
-
-            results.append({
-                "doc_id": doc_id,
-                "filename": file.filename,
-                "status": "indexed",
-                "pages": parsed.total_pages,
-                "chunks_created": len(chunks)
-            })
-            logger.info(f"Batch: indexed {file.filename} | {len(chunks)} chunks")
+            results.append({"doc_id": doc_id, "filename": file.filename, "status": "indexed",
+                            "pages": parsed.total_pages, "chunks_created": len(chunks)})
 
         except Exception as e:
-            logger.error(f"Batch upload error for {file.filename}: {e}")
-            results.append({
-                "filename": file.filename,
-                "status": "error",
-                "error": str(e)
-            })
+            logger.error(f"Batch error {file.filename}: {e}")
+            results.append({"filename": file.filename, "status": "error", "error": str(e)})
 
-    total = len(results)
     indexed = sum(1 for r in results if r["status"] == "indexed")
     skipped = sum(1 for r in results if r["status"] == "skipped")
     errors = sum(1 for r in results if r["status"] == "error")
+    return {"total": len(results), "indexed": indexed, "skipped": skipped, "errors": errors, "results": results}
 
-    return {
-        "total": total,
-        "indexed": indexed,
-        "skipped": skipped,
-        "errors": errors,
-        "results": results
-    }
+
+@app.post("/query", response_model=QueryResponse)
+async def query_knowledge_base(request: QueryRequest):
+    if not request.question.strip():
+        raise HTTPException(400, "Question cannot be empty")
+
+    start_time = time.time()
 
     trace = None
     if LANGFUSE_ENABLED:
         try:
-            trace = langfuse.trace(
-                name="rag_query",
-                input=request.question,
-                tags=["query"]
-            )
+            trace = langfuse.trace(name="rag_query", input=request.question, tags=["query"])
         except Exception as e:
             logger.warning(f"Langfuse trace failed: {e}")
 
-    # --- Retrieval ---
     t0 = time.time()
     expanded_queries = await query_expander.expand(request.question)
     chunks = await retriever.retrieve_expanded(expanded_queries, top_k=request.top_k * 2)
@@ -398,66 +358,43 @@ async def upload_batch(files: list[UploadFile] = File(...)):
 
     if trace:
         try:
-            trace.span(
-                name="retrieval",
-                input=request.question,
-                output={"chunks_found": len(chunks)},
-                metadata={"duration_ms": retrieval_ms}
-            )
+            trace.span(name="retrieval", input=request.question,
+                      output={"chunks_found": len(chunks)}, metadata={"duration_ms": retrieval_ms})
         except Exception as e:
             logger.warning(f"Langfuse span failed: {e}")
 
     if not chunks:
-        return QueryResponse(
-            answer="No relevant information found in the knowledge base.",
-            sources=[],
-            model=generator.model,
-            tokens_used=0
-        )
+        return QueryResponse(answer="No relevant information found in the knowledge base.",
+                           sources=[], model=generator.model, tokens_used=0)
 
-    # --- Rerank ---
     top_chunks = reranker.rerank(request.question, chunks, top_k=min(request.top_k, 3))
 
-    # --- Prompt ---
-    messages = prompt_builder.build(
-        query=request.question,
-        chunks=top_chunks,
-        chat_history=request.chat_history
-    )
+    messages = prompt_builder.build(query=request.question, chunks=top_chunks,
+                                   chat_history=request.chat_history)
 
-    # --- Generate ---
     t1 = time.time()
     result = await generator.generate(messages)
     generation_ms = int((time.time() - t1) * 1000)
 
     if trace:
         try:
-            trace.generation(
-                name="llm_generation",
-                model=result["model"],
-                input=messages,
-                output=result["answer"],
-                usage={
-                    "input": result.get("prompt_tokens", 0),
-                    "output": result.get("completion_tokens", 0),
-                    "total": result["total_tokens"]
-                },
-                metadata={"duration_ms": generation_ms}
-            )
+            trace.generation(name="llm_generation", model=result["model"],
+                           input=messages, output=result["answer"],
+                           usage={"input": result.get("prompt_tokens", 0),
+                                  "output": result.get("completion_tokens", 0),
+                                  "total": result["total_tokens"]},
+                           metadata={"duration_ms": generation_ms})
         except Exception as e:
             logger.warning(f"Langfuse generation failed: {e}")
 
-    # --- Sources ---
     seen_sources = set()
     sources = []
     for c in top_chunks:
-        # Дедупликация по тексту — убирает одинаковые чанки из разных запросов
         raw = c["text"].strip().replace("\n", " ")
         text_key = raw[:80].lower()
         if text_key in seen_sources:
             continue
         seen_sources.add(text_key)
-        raw = c["text"].strip().replace("\n", " ")
         excerpt = raw[:150].rsplit(" ", 1)[0] + "…" if len(raw) > 150 else raw
         sources.append({
             "page": c.get("page_num"),
@@ -468,37 +405,23 @@ async def upload_batch(files: list[UploadFile] = File(...)):
 
     total_ms = int((time.time() - start_time) * 1000)
 
-    # Финализируем trace
     if trace:
         try:
-            trace.update(
-                output=result["answer"],
-                metadata={
-                    "total_ms": total_ms,
-                    "retrieval_ms": retrieval_ms,
-                    "generation_ms": generation_ms,
-                    "tokens_used": result["total_tokens"],
-                    "sources_count": len(sources)
-                }
-            )
+            trace.update(output=result["answer"],
+                        metadata={"total_ms": total_ms, "retrieval_ms": retrieval_ms,
+                                  "generation_ms": generation_ms, "tokens_used": result["total_tokens"],
+                                  "sources_count": len(sources)})
             langfuse.flush()
         except Exception as e:
             logger.warning(f"Langfuse update failed: {e}")
 
-    return QueryResponse(
-        answer=result["answer"],
-        sources=sources,
-        model=result["model"],
-        tokens_used=result["total_tokens"]
-    )
+    return QueryResponse(answer=result["answer"], sources=sources,
+                        model=result["model"], tokens_used=result["total_tokens"])
 
 
 @app.get("/documents")
 async def list_documents():
-    return {
-        "total": len(documents_registry),
-        "documents": list(documents_registry.values())
-    }
+    return {"total": len(documents_registry), "documents": list(documents_registry.values())}
 
 
 @app.delete("/documents/{doc_id}")
@@ -508,38 +431,25 @@ async def delete_document(doc_id: str):
 
     filename = documents_registry[doc_id].get("filename", doc_id)
 
-    # Удаляем из Qdrant
     try:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
         vector_store.client.delete(
             collection_name=vector_store.collection,
-            points_selector=Filter(
-                must=[FieldCondition(
-                    key="document_id",
-                    match=MatchValue(value=doc_id)
-                )]
-            )
+            points_selector=Filter(must=[FieldCondition(key="document_id", match=MatchValue(value=doc_id))])
         )
-        logger.info(f"Deleted from Qdrant: {doc_id}")
     except Exception as e:
         logger.warning(f"Qdrant delete failed: {e}")
 
-    # Удаляем из BM25 — пересобираем без этого документа
     try:
-        remaining = [
-            c for c in retriever._bm25_chunks
-            if c.get("document_id") != doc_id
-        ]
+        remaining = [c for c in retriever._bm25_chunks if c.get("document_id") != doc_id]
         if remaining:
             retriever.index_chunks_for_bm25(remaining)
         else:
             retriever._bm25_index = None
             retriever._bm25_chunks = []
-        logger.info(f"BM25 rebuilt without {doc_id}: {len(remaining)} chunks left")
     except Exception as e:
         logger.warning(f"BM25 rebuild failed: {e}")
 
-    # Удаляем из PostgreSQL
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -547,47 +457,31 @@ async def delete_document(doc_id: str):
         conn.commit()
         cur.close()
         conn.close()
-        # Удаляем из in-memory кэша хэшей
-        file_hashes_to_remove = [h for h, d in file_hashes.items() if d == doc_id]
-        for h in file_hashes_to_remove:
+        for h in [h for h, d in file_hashes.items() if d == doc_id]:
             del file_hashes[h]
-        logger.info(f"Deleted hash from DB for {doc_id}")
     except Exception as e:
         logger.warning(f"DB delete failed: {e}")
 
-    # Удаляем файл с диска
     try:
         for f in UPLOAD_DIR.glob(f"{doc_id}_*"):
             f.unlink()
-            logger.info(f"Deleted file: {f}")
     except Exception as e:
         logger.warning(f"File delete failed: {e}")
 
-    # Удаляем из registry
     del documents_registry[doc_id]
-
     return {"status": "deleted", "doc_id": doc_id, "filename": filename}
-
 
 
 @app.get("/pdf/{doc_id}")
 async def get_pdf(doc_id: str):
-    """Serve PDF file for viewer."""
     from fastapi.responses import FileResponse
     if doc_id not in documents_registry:
         raise HTTPException(404, "Document not found")
-    filename = documents_registry[doc_id]["filename"]
-    file_path = None
     for f in UPLOAD_DIR.glob(f"{doc_id}_*"):
-        file_path = f
-        break
-    if not file_path or not file_path.exists():
-        raise HTTPException(404, "PDF file not found on disk")
-    return FileResponse(
-        path=str(file_path),
-        media_type="application/pdf",
-        filename=filename
-    )
+        return FileResponse(path=str(f), media_type="application/pdf",
+                          filename=documents_registry[doc_id]["filename"])
+    raise HTTPException(404, "PDF file not found on disk")
+
 
 @app.get("/health")
 async def health_check():
@@ -597,7 +491,6 @@ async def health_check():
         qdrant_ok = True
     except:
         info = {}
-
     return {
         "status": "healthy" if qdrant_ok else "degraded",
         "components": {

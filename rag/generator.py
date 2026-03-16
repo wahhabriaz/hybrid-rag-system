@@ -21,7 +21,6 @@ class LLMGenerator:
         self.ollama_url = ollama_url
         self.model = model
         self.temperature = temperature
-        # Low temperature = more deterministic = fewer hallucinations
         logger.info(f"LLMGenerator ready | model={model} temp={temperature}")
 
     async def generate(self, messages: list[dict], retries: int = 3) -> dict:
